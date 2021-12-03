@@ -1,0 +1,938 @@
+---
+title: "group report"
+output: html_document
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Общая логика рекомендации
+
+## Какие переменные использовали и почему
+
+**Система, основанная на коллаборативной фильтрации**
+
+**Content-based рекомендательная система**
+* actor_1, actor_2, actor_3, actor_4, actor_5, director — переменные из дополнительного датасета (данные об актёрах и режиссёрах);
+* spoken_languages;
+* genres.
+
+## Входные данные
+
+**Система, основанная на коллаборативной фильтрации:** id пользователя
+**Система, основанная на коллаборативной фильтрации:** 
+1. Любимый и нелюбимый фильм пользователя
+2. 5 любимых фильмов пользователя
+
+## Как проводили оценку
+
+**Система, основанная на коллаборативной фильтрации:**
+1. Оценка по общему принципу, описанному в лабораторной 8
+2. Оценка с помощью метрик отклонения (RMSE, MAE, MSE)
+
+**Content-based рекомендательная система:**
+1. Внутренняя пользовательская проверка на соответствие рекомендации ожиданиям
+2. Сравнивали, какие характеристики рекомендованных фильмов совпали с характеристиками любимых фильмов пользователя
+
+## Холодный старт
+
+В случае «холодного старта» мы предлагаем пользователю выбрать темы фильмов, которые мы выделили с помощью LDA. Подробнее о них сказано ниже.  
+
+# Предобработка данных, загрузка дополнительного датасета
+
+Загрузим библиотеки
+```{r}
+library(rpart)
+library(readr)
+library(tidyverse)
+library(Metrics)
+if (!require("pacman")) install.packages("pacman")
+pacman::p_load_gh("trinker/textstem")
+library(textstem)
+library(magrittr)
+library(tidytext)
+library(stopwords)
+```
+
+Загрузим изначальные датасеты и датасеты с доп. данными
+```{r}
+load("~/shared/minor2_2019/2-tm-net/project/data/movies_data/data32.rda")
+load(file="~/shared/minor2_2019_32/movies2.rda")
+```
+
+Добавим дополнительные данные о режиссёрах, актёрах и сценаристах. 
+```{r eval = F}
+cast <- read.csv(
+  file = '~/AllMoviesCastingRaw.csv',
+  sep = ';',
+  encoding = 'UTF-8'
+  )
+all_movies <- read.csv(
+  file = '~/AllMoviesDetailsCleaned.csv',
+  sep = ';',
+  encoding = 'UTF-8'
+  )      
+all_movies = all_movies %>% rename(id = X.U.FEFF.id)
+movies = movies99
+
+additional_data = all_movies %>% left_join(cast, by = "id")
+movies = movies %>% left_join(additional_data, by = "imdb_id") %>% dplyr::select(adult:vote_count.x, production_companies_number:editor_name)
+aga = movies %>% select(production_companies_number:editor_name)
+colnames(movies) = c(colnames(movies99),colnames(aga))
+```
+
+1.2. Идея: Мы решили привлечь доп. данные про актёров, режиссёров и остальных членов команды. 
+
+```{r}
+movies_original = movies
+movies$movieId = movies$id
+movies = movies %>% filter(!actor_number<=2) # это понадобится позже для рекомендательной системы. Система с фильмами, среди которых присутствовали 2 и меньше актёров, выдавала неадекватные рекомендации (всегда рекомендовались одни и те же фильмы)
+movies_saved = movies
+actor1 = movies_saved %>% dplyr::select(movieId, actor1_name) %>% dplyr::rename(actor = actor1_name)
+actor2 = movies_saved %>% dplyr::select(movieId, actor2_name)%>% dplyr::rename(actor = actor2_name)
+actor3 = movies_saved %>% dplyr::select(movieId, actor3_name)%>% dplyr::rename(actor = actor3_name)
+actor4 = movies_saved %>% dplyr::select(movieId, actor4_name)%>% dplyr::rename(actor = actor4_name)
+actor5 = movies_saved %>% dplyr::select(movieId, actor5_name)%>% dplyr::rename(actor = actor5_name)
+
+#Оставим только нужные переменные.
+hm = actor1 %>% full_join(actor2) %>% full_join(actor3)%>% full_join(actor4)%>% full_join(actor5)%>% arrange(-movieId)%>% filter(!is.na(actor))
+movies = movies_saved %>% dplyr::select(movieId,title, director_name) %>% left_join(hm)
+```
+
+3. Чтобы понять, помогут ли нам актёры и режиссёры при построении рекомендательной системы, я решила построить регрессионное дерево, предсказывающее значение переменной rating в зависимости от актёра и режиссёра
+
++ Разделим фильмы на тестовую и тренировочную выборки.
+```{r}
+ratings = ratings99 %>% group_by(movieId) %>% summarize(rating = mean(rating, na.rm = T))
+#делим данные
+set.seed(777)
+
+films.train = movies_saved %>% #444
+  sample_frac(0.8)
+
+
+films.test = movies_saved %>%  #111
+  filter(!(movieId %in% films.train$movieId))
+```
+
++ Присоеденим все нужные наблюдения об актёрах и рейтингах.
+```{r}
+movies.train = movies %>% inner_join(films.train)%>% left_join(ratings)
+movies.test = movies %>% inner_join(films.test)%>% left_join(ratings)
+
+movies.train = movies.train %>%filter(!is.na(actor)) %>% filter(!is.na(rating)) 
+movies.test = movies.test %>% filter(!is.na(actor)) %>% filter(!is.na(rating)) 
+movies.test = movies.test %>% filter(actor%in%movies.train$actor)
+```
+
+Построим регрессиионное дерево, предсказывающее переменную rating по переменной actor.
+```{r}
+tree.regr_act = rpart(rating ~ actor, data = movies.train) 
+```
+
+Оценим точность дерева на тестовой выборке методом объяснённой дисперсии и, если не получится, методом подсчёта средней абсолюной процентной ошибки.
+```{r}
+pred = predict(tree.regr_act, movies.test)
+
+# RSS - Residual Sum of Squares
+rss = sum((pred - movies.test$rating)^2) 
+# TSS - Total Sum of Squares
+tss = sum((mean(movies.test$rating) - movies.test$rating)^2) 
+
+# R^2 - Доля объясненной дисперсии
+1 - (rss / tss) #показывает как много кейсов модель предсказывает верно. Чем выше, тем лучше 
+```
+
+Возможно, модель нам не подходит, но можно попробовать измерить ещё один показатель - MAPE(mean absolute percentage error). Если 1-MAPE окажется высоким, то модель всё-таки подойдёт.
+
+```{r}
+mape = mape(pred,movies.test$rating)
+1-mape #Точность прогноза
+```
+
+Прогноз точен, поэтому используем актёров для построения рекомендательной системы.
+
+Проделаем то же самое для режиссёров.
+```{r}
+movies.train = movies %>% inner_join(films.train)%>% left_join(ratings)
+movies.test = movies %>% inner_join(films.test)%>% left_join(ratings)
+
+movies.train = movies.train %>%filter(!is.na(director_name)) %>% filter(!is.na(rating)) 
+movies.test = movies.test %>% filter(!is.na(director_name)) %>% filter(!is.na(rating)) 
+movies.test = movies.test %>% filter(director_name%in%movies.train$director_name)
+```
+
+Построим регрессиионное дерево, предсказывающее переменную rating по переменной director_name.
+```{r}
+tree.regr_dir = rpart(rating ~ director_name, data = movies.train) 
+```
+
+Оценим точность дерева тем же методом.
+```{r}
+pred = predict(tree.regr_dir, movies.test)
+
+# RSS - Residual Sum of Squares
+rss = sum((pred - movies.test$rating)^2) 
+# TSS - Total Sum of Squares
+tss = sum((mean(movies.test$rating) - movies.test$rating)^2) 
+
+# R^2 - Доля объясненной дисперсии
+1 - (rss / tss) #показывает как много кейсов модель предсказывает верно. Чем выше, тем лучше 
+```
+
+Приблизительно такие же результаты при проверке R^2. Посчитаем 1-MAPE.
+```{r}
+mape = mape(pred,movies.test$rating)
+1-mape #Точность прогноза
+```
+Прогноз так же точен, поэтому директоров мы тоже используем для построения рекомендательной системы.
+
+Попробуем совместить их.
+
+```{r}
+movies.train = movies %>% inner_join(films.train)%>% left_join(ratings)
+movies.test = movies %>% inner_join(films.test)%>% left_join(ratings)
+
+movies.train = movies.train %>%filter(!is.na(director_name)) %>% filter(!is.na(rating)) %>%filter(!is.na(actor))
+movies.test = movies.test %>% filter(!is.na(director_name)) %>% filter(!is.na(rating))  %>%filter(!is.na(actor))
+movies.test = movies.test %>% filter(director_name%in%movies.train$director_name)%>% filter(actor%in%movies.train$actor)
+```
+
+Построим дерево по обеим переменным.
+```{r}
+tree.regr = rpart(rating ~ director_name+actor, data = movies.train) 
+```
+
+Оценим точность дерева.
+```{r}
+pred = predict(tree.regr, movies.test)
+```
+
+```{r}
+# RSS - Residual Sum of Squares
+rss = sum((pred - movies.test$rating)^2) #из предсказ - реальн
+# TSS - Total Sum of Squares
+tss = sum((mean(movies.test$rating) - movies.test$rating)^2) 
+
+# R^2 - Доля объясненной дисперсии
+1 - (rss / tss) #показывает как много кейсов модель предсказывает верно. Чем выше, тем лучше 
+```
+
+Приблизительно такие же результаты при проверке R^2. Посчитаем 1-MAPE.
+```{r}
+mape = mape(pred,movies.test$rating)
+1-mape #Точность прогноза
+```
+Точность немного выше, чем если брать просто режиссёров, и немного ниже, чем если брать просто актёров. Тем не менее, опросив друзей и членов семьи, я узнала, что большинство из них скорее смотрели бы и на актёра, и на режиссёра, выбирая фильм, поэтому остановимся на актёрах и режиссёрах.
+P.S. я не рисовала дерево, потому что это проблематично, ведь данных слишком много.
+
+На мой взгляд, самые адекватные примеры получились у системы actors and directors, но мы решили дополнить её переменными, выявленными при сетевом анализе Ксенией Сливкиной (то есть, язык оригинала и жанры). Так же важность жанра была выявлена Егором при разведочном анализе.
+
+Строил нашу финальную матрицу рекомендательных систем Егор Дулесов.
+```{r}
+movies_genres = movies_saved %>% select(genres, movieId)
+
+source("~/shared/minor2_2019/2-tm-net/project/extract_json.R") 
+
+# заменим тип кавычек (иначе функция не разбирает строку правильно)
+movies_genres$genres = str_replace_all(movies_genres$genres, fixed("'"), '"')
+
+# запустим функцию, которая преобразует строку в отдельные жанры
+movies_genres = extract_json2(df = movies_genres, col = "genres")
+```
+
+
+Создаем матрицу с жанрами
+```{r}
+movies_genres = movies_genres %>% select(-genres)
+rec_genr = movies_genres %>% spread(key = genres_sep, value = genres_v, fill = 0)
+```
+
+```{r}
+#Считаем среднюю оценку фильма по отзывам "наших" пользователей
+
+data = ratings99 %>% group_by(movieId) %>% summarize(rating = mean(rating, na.rm = T))
+data = inner_join(data, movies)
+
+#Преобразуем актёров и директоров в столбцы.
+
+data$actors = 1
+data$directors = 1
+data = data %>% spread(key = actor, value = actors, fill = 0)
+data = data %>% spread(key = director_name, value = directors, fill = 0)
+
+#Удаляем лишние переменные
+
+data = data %>% dplyr::select(-title)
+```
+
+Посмотрим на каких языках в основном доступны фильмы
+```{r}
+movie_lang2 = movies_saved %>% select(spoken_languages, movieId)
+
+source("~/shared/minor2_2019/2-tm-net/project/extract_json.R") 
+
+# заменим тип кавычек (иначе функция не разбирает строку правильно)
+movie_lang2$spoken_languages = str_replace_all(movie_lang2$spoken_languages, fixed("'"), '"')
+
+# запустим функцию, которая преобразует строку в отдельные жанры
+movie_lang2 = extract_json2(df = movie_lang2, col = "spoken_languages")
+movie_lang2 = movie_lang2[,-1]
+
+movie_lang2_count = movie_lang2 %>% group_by(spoken_languages_sep) %>% summarise(count = n())
+
+ggplot(movie_lang2_count, aes(x = spoken_languages_sep, y = count), stat = "identity")+
+  geom_bar(stat = "identity", fill = "#20B2AA")+
+  xlab("Языки") + 
+  ylab("Количество фильмов") +
+  theme_bw()+
+  coord_flip()
+```
+*Как мы видим, на многих языках доступно очень малое количество фильмов*
+
+Создаем матрицу для языков фильмов
+```{r}
+rec_lang = movie_lang2_count %>% filter(count > 3) %>% filter(!spoken_languages_sep %in% c("", "No Language")) %>% left_join(movie_lang2) %>% left_join(movies_saved) %>% select(movieId, spoken_languages_sep, spoken_languages_v)
+rec_lang = rec_lang %>% spread(key = spoken_languages_sep, value = spoken_languages_v, fill = 0)
+```
+
+Объединяем матрицы и считаем схожесть фильмов
+```{r}
+rec = data %>% left_join(rec_genr) %>% left_join(rec_lang)
+
+rownames(rec) = rec$movieId
+rec = rec %>% dplyr::select(-movieId)
+sim = lsa::cosine(t(as.matrix(rec)))
+```
+
+# Функции с рекомендательными системами, проверка на примерах
+
+## Коллаборативная фильтрация
+Мы заменили IBCF-систему, которую показывали в презентации, на UBCF. После peer review, где нам предложили сравнить результаты IBCF и UBCF-систем, мы построили UBCF-систему, и оказалось, что метрики отклонения у неё меньше, чем у IBCF-системы.
+
+```{r message = FALSE}
+library(jsonlite)
+library(recommenderlab)
+library(tidyr)
+```
+
+```{r}
+load("~/shared/minor2_2019/2-tm-net/project/data/movies_data/data32.rda")
+```
+
+Построим рекомендательную систему на основе коллаборативной фильтрации
+
+Работаем с данными:
+```{r}
+movies = movies99
+movies = movies %>% rename(movieId = id)
+ratings = ratings99
+ratings = select(ratings, -timestamp)
+rates = spread(ratings, key = movieId, value = rating)
+rownames(rates) = rates$userId
+rates = select(rates, -userId)
+rates = as.matrix(rates)
+r = as(rates, "realRatingMatrix")
+ratings_movies <- r[rowCounts(r) > 5, colCounts(r) > 10] 
+```
+
+Создадим функцию
+```{r}
+getFilmsColab = function(user_Id){
+  recc_model <- Recommender(data = ratings_movies, method = "UBCF")
+  recc_predicted <- predict(object = recc_model, newdata = ratings_movies, n = 5)
+
+  recc_user_1 <- recc_predicted@items[[user_Id]]
+  movies_user_1 <- recc_predicted@itemLabels[recc_user_1]
+  names_movies_user_1 <- movies$title[match(movies_user_1, movies$movieId)]
+  names_movies_user_1
+}
+```
+
+Рассмотрим её работу на примере пользователя 270124
+
+```{r}
+getFilmsColab("270124")
+```
+
+Оценим полученную модель с помощью общего принципа
+
+```{r}
+recc_model <- Recommender(data = ratings_movies, method = "UBCF")
+recc_predicted <- predict(object = recc_model, newdata = ratings_movies, n = 5)
+recc_user_1 <- recc_predicted@items[["270124"]]
+movies_user_1 <- recc_predicted@itemLabels[recc_user_1]
+names_movies_user_1 <- movies$title[match(movies_user_1, movies$movieId)]
+names_movies_user_1
+```
+
+Возьмем пользовательский топ-5 фильмов с имеющимися оценками. Но сначала преобразуем жанры
+```{r message=F, warning=FALSE}
+source("~/shared/minor2_2019/2-tm-net/project/extract_json.R")
+movies$genres = str_replace_all(movies$genres, fixed("'"), '"')
+movies = extract_json2(df = movies, col = "genres")
+
+top5 = filter(ratings, userId == 270124) %>% 
+  top_n(5, rating) %>% inner_join(movies, by = "movieId")
+
+user_genre = select(top5, genres_sep, movieId)
+user_genre %>% count(genres_sep) %>% arrange(-n) %>% mutate(prop = n/sum(n))
+```
+
+А теперь посмотрим на жанры предсказания
+```{r}
+pred5 = movies %>% filter(movieId %in% movies_user_1)
+
+user_prediction = select(pred5,genres_sep, movieId)
+user_prediction %>% count(genres_sep) %>% arrange(-n) %>% mutate(prop = n/sum(n))
+```
+
+Жанры драма, триллер и боевик в нашей можели совпадают с теми жанрами фильмов, которые пользователь высоко оценил. Однако, есть и существенные различия, например, один из самых любимых жанров пользователя - научная фантастика, отсутствует среди рекомендованых нами. Таким образом, данная система не идеальна, но вполне может подобрать фильмы, которые были бы интересны пользователю.
+
+Теперь проведём оценку системы с помощью различных метрик (RMSE, MAE, MSE).
+
+Указываем размер обучающей выборки, параметры минимального количества оценок и наименьшей оценки
+```{r}
+set.seed(100)
+eval_sets1 <- evaluationScheme(data = ratings_movies, 
+                              method = "split",
+                              train = 0.8,
+                              given = 3, # сколько оценок используется для  предсказания
+                              goodRating = 4) # если предсказанная оценка < 4, то фильм не рекомендуем
+```
+
+Строим предсказательную модель
+```{r}
+recc_model1 <- Recommender(data = getData(eval_sets1, "train"), method = "UBCF")
+recc_predicted1 <- predict(object = recc_model1, newdata = getData(eval_sets1, "known"), n = 5, type = "ratings")
+```
+
+Смотрим на точность модели
+```{r}
+eval_accuracyy <- calcPredictionAccuracy(x = recc_predicted1,
+                                         # predicted values
+                                         data = getData(eval_sets1, "unknown"),
+                                         byUser = F) # not averaging for each user
+eval_accuracyy
+```
+
+MAE и RMSE достаточно низкие, что хорошо, но не настолько, чтобы ими пренебречь. Учитывая, что у нас оценка от 1 до 5, а RMSE и MAE ~1.03 и ~0.78 соответственно, получается, что наша система может сбоить иногда. Это подтверждает результаты анализа схожести жанров: в общем результаты рекомендации соответсвуют интересам пользователя, но есть небольшие недочёты, например, отсутсвие одного из любимых жаров пользователя в предложенных нами фильмах.
+
+## Content-based рекомендательная система
+1. Первая называется «Введите любимый и нелюбимый фильм». Будут выводиться фильмы, максимально похожие на любимый фильм пользователя, и если среди них есть фильмы, максимально похожие на его нелюбимый фильм, то они выводиться не будут.
+А если фильм, который пользователю не нравится, очень похож на тот, который ему нравится, то ему будет предложено попробовать ввести другие фильмы.
+```{r}
+diag(sim)=0
+movies_n = movies_saved %>% dplyr::select(title,movieId)
+getGoodFilms = function(film_good_name, film_bad_name, num){
+    trash = movies_n %>% filter(title == film_bad_name)
+    film_bad = trash$movieId
+    mostUnsimilar = head(sort(sim[,as.character(film_bad)], decreasing = T), num)
+    b = which(sim[,as.character(film_bad)] %in% mostUnsimilar, arr.ind = TRUE)
+    sim2 = sim
+    sim2 = sim2[-b[1],-b[1]]
+    for (i in 1:(num-1)){
+    sim2 = sim2[-(b[i+1]-i),-(b[i+1]-i)]
+    }
+    set = movies_n %>% filter(title == film_good_name)
+    film = set$movieId
+    names = names(mostUnsimilar)
+    df = as.data.frame(names)
+    if (dim(df %>% filter(names %in% film))[1]== 1){
+    print("Введите другой любимый фильм, у вас противоречивые вкусы")
+    }else{
+    mostSimilar = head(sort(sim2[,as.character(film)], decreasing = T), n = num)
+    a = which(sim2[,as.character(film)] %in% mostSimilar, arr.ind = TRUE)
+    result = rownames(sim2)[a]
+    recommend = filter(movies_n,movieId %in% result) %>% dplyr::select(title)
+    recommend
+    }
+}
+```
+
+2. Следующая функция — «Введите n любимых фильмов». Пользователь должен создать сет из своих любимых фильмов, указать, какое количество он ввёл и указать, сколько рекомендаций он хочет получить.
+Изначально пользователь должен был ввести 5 фильмов, но в peer review нам неоднократно намекнули, что это очень много, поэтому мы изменили функцию так, чтобы пользователь сам определял, сколько фильмов он хочет ввести.
+```{r}
+byfilms = function(set, n, num){
+    setik = movies_n %>% filter(title %in% set)
+    if (dim(setik)[1]<n){
+      for (k in 1:(n)){
+        wrong = movies_n %>% filter(title %in% set_try[k])
+        if (dim(wrong)[1]==0){
+        print(paste("Фильма номер", k, "нет в базе, введите другой фильм"))
+        }
+      }
+    }else{film = setik$movieId
+          films = as.data.frame(film)
+          films2 =c(sim[,as.character(films$film[1])])
+          if (n>1){
+            for (k in 2:(n)){
+              films2 = append(films2,sim[,as.character(films$film[k])])
+            }
+          }
+          films2 = films2[!names(films2) %in% film]
+          mostSimilar = head(sort(films2, decreasing = T), n = num)
+        for (k in 1:(num-1)){
+            for (i in (k+1):num){
+              if ((names(mostSimilar)[k]==names(mostSimilar)[i])==T){
+                wrong = mostSimilar[i]
+                mostSimilar= head(sort(films2, decreasing = T), n = num+(num-length(unique(mostSimilar)))) 
+                mostSimilar=mostSimilar[-wrong]
+              }
+            mostSimilar= head(mostSimilar, num)
+            }
+        }
+        recommend = movies_n %>% filter(as.character(movieId) %in% names(mostSimilar)) %>% dplyr::select(title)
+        recommend
+    }
+}
+```
+
+Проверим систему.
+```{r}
+set_try = c("The Sixth Sense", "Die Hard","Die Hard 2","Saw II")
+byfilms(set_try,4,5)
+```
+Все рекомендованные фильмы оказались ужастиками или триллерами.
+
+Что будет, если ввести фильм не из базы?
+```{r}
+set_try = c("The Sixth Sense", "kek","lol","Saw II")
+byfilms(set_try,4,5)
+```
+Пользователь может заменить эти фильмы или просто ввести меньше фильмов.
+
+Посмотрим рекомендацию для юзера 132310. Найдём его любимый и нелюбимый фильм и посоветуем ему другие.
+```{r}
+movies_original$movieId = movies_original$id
+data = ratings99 %>% left_join(movies_original) %>% select(userId,rating,movieId,title)
+best = data %>% filter(userId == "132310") %>% arrange(-rating) %>% head(5)
+best = best$title[3]#возьмём случайный, т.к. рейтинг одинаков
+worst = data %>% filter(userId == "132310") %>% arrange(rating) %>% head(5)
+worst = worst$title[1]
+rec_user = getGoodFilms(best, worst,5)
+rec_user
+best
+worst
+```
+Вывелись рекомендации ему, его любимый и нелюбимый фильмы.
+
+Посмотрим на характеристики фильмов (по которым мы рекомендовали), которые мы ему рекомендовали.
+```{r}
+raz = movies %>% left_join(movies_saved)%>% inner_join(rec_user) %>% select(title,genres,original_language,actor,director_name)
+raz
+```
+
+Теперь посмотрим на все характеристики любимого и нелюбимого фильма.
+```{r}
+best_d = data %>% filter(userId == "132310", title == best)
+worst_d = data %>% filter(userId == "132310",title== worst) 
+dva_best = movies %>% left_join(movies_saved) %>% inner_join(best_d) %>% select(title,genres,original_language,actor,director_name)
+dva_worst = movies %>% left_join(movies_saved) %>% inner_join(worst_d) %>% select(title,genres,original_language,actor,director_name)
+dva_best
+dva_worst
+```
+
+Есть ли совпадения с любимым фильмом?
+```{r}
+raz_actors = unique(raz$actor)
+raz_directors = unique(raz$director_name)
+raz_lang = unique(raz$original_language)
+
+dva_best_actors = unique(dva_best$actor)
+dva_best_directors = unique(dva_best$director_name)
+dva_best_lang = unique(dva_best$original_language)
+intersect(raz_actors,dva_best_actors)
+intersect(raz_directors,dva_best_directors)
+intersect(raz_lang,dva_best_lang)
+```
+Совпадает один режиссёр, одна актриса/один актёр и язык.
+
+Посмотрим на нелюбимый фильм.
+
+```{r}
+dva_worst_actors = unique(dva_worst$actor)
+dva_worst_directors = unique(dva_worst$director_name)
+dva_worst_lang = unique(dva_worst$original_language)
+intersect(raz_actors,dva_worst_actors)
+intersect(raz_directors,dva_worst_directors)
+intersect(raz_lang,dva_worst_lang)
+```
+Совпадает только язык.
+
+Проверим рекомендации второй системы для этого же юзера. Допустим, он ввёл 5 фильмов и хочет 5 рекомендаций.
+Посмотрим на рекомендованные ему фильмы.
+```{r}
+best = data %>% filter(userId == "132310") %>% arrange(-rating) %>% head(5)
+best_films = best$title 
+set = c(best_films[1],best_films[2],best_films[3],best_films[4],best_films[5])
+rec_user = byfilms(set,5,5)
+raz = movies %>% left_join(movies_saved) %>% inner_join(rec_user) %>% select(title,genres,original_language,actor,director_name)
+raz
+```
+
+Посмотрим на введённые им фильмы.
+```{r}
+a = best %>% select(title)
+dva = movies%>% left_join(movies_saved) %>% inner_join(a) %>% select(title,genres,original_language,actor,director_name)
+dva
+```
+
+```{r}
+u = raz%>% select(actor) %>% inner_join(dva)
+unique(u$actor)
+m = raz %>% select(director_name) %>% inner_join(dva)
+unique(m$director_name)
+v = raz %>% select(original_language) %>% inner_join(dva)
+unique(v$original_language)
+```
+Совпала актриса, режиссёр, два языка.
+
+
+
+# Сети и тексты
+
+## Сети
+
+В ходе сетевого анализа использовались следующие переменные:
+
+* genres
+* production-companies
+* production-countries
+* spoken_languages
+
+```{r}
+library(tidyverse)
+library(igraph)
+load("~/shared/minor2_2019/2-tm-net/project/data/movies_data/data32.rda")
+```
+
+Выделим сообщетсва фильмов, близких с точки зрения жанров.
+```{r fig.width= 20, fig.height= 20, echo = FALSE}
+movies99 = movies99 %>% rename(movieId = id)
+source("~/shared/minor2_2019/2-tm-net/project/extract_json.R") 
+movies99$genres = str_replace_all(movies99$genres, fixed("'"), '"')
+movies_with_genres = extract_json2(df = movies99, col = "genres")
+meta <- movies_with_genres %>% 
+  dplyr::select(movieId, genres_v, genres_sep)
+meta = meta %>% spread(key = genres_sep, value = genres_v, fill = 0)
+rownames(meta) <- str_c(meta$movieId)
+meta = meta %>% dplyr::select(-movieId) %>% as.matrix()
+g <- graph_from_incidence_matrix(meta)
+pr = bipartite.projection(g) 
+p <- pr[[1]]
+V(p)$label <- NA
+lt = layout.fruchterman.reingold(p)
+com = walktrap.community(p)
+plot(com, p, 
+     vertex.label.color = "black", vertex.size = 3,)
+```
+
+```{r}
+length(unique(membership(com)))
+```
+Получаем 9 групп
+
+```{r}
+for(i in 1:9) cat("В",i,"группе",sum(membership(com)==i),"фильмов", "\n")
+```
+Таким образом, можно использовать жанры для деления на сообщества,  2 группы по 1 фильму не создадут проблем, так как для них можно будет использовать другие параметры при рекомендации.
+
+
+Выделим сообщества фильмов, близких с точки зрения языков, на которых доступен просмотр фильма на Netflix.
+
+```{r fig.width= 10, fig.height= 10}
+movies99$spoken_languages = str_replace_all(movies99$spoken_languages, fixed("'"), '"')
+movies_with_spoken_languages = extract_json2(df = movies99, col = "spoken_languages")
+languages <- movies_with_spoken_languages %>% 
+  dplyr::select(movieId, spoken_languages_v, spoken_languages_sep)
+languages = languages %>% filter(spoken_languages_sep != "")
+languages = languages %>% spread(key = spoken_languages_sep, value = spoken_languages_v, fill = 0)
+rownames(languages) <- str_c(languages$movieId)
+languages = languages %>% dplyr::select(-movieId) %>% as.matrix()
+gl <- graph_from_incidence_matrix(languages)
+pl = bipartite.projection(gl) 
+pll <- pl[[1]]
+V(pll)$label <- NA
+lt = layout.fruchterman.reingold(pll)
+lan = walktrap.community(pll)
+plot(lan, pll, 
+     vertex.label.color = "black", vertex.size = 3,)
+```
+
+```{r}
+length(unique(membership(lan)))
+```
+
+Получаем 27 сообществ
+
+```{r}
+for(j in 1:27) cat("В",j,"группе",sum(membership(lan)==j),"фильмов", "\n")
+```
+
+Снова у нас есть группы по одному фильму. Поэтому надо будет отфильтровать языки и убрать очень редкие. Данную переменную стоит вкючить в систему рекомендаций.
+
+Сетевой анализ стран-производителей и компаний-производителей не дал полезных результатов: у первой переменной получилось очень мало групп, между которыми фильмы распределены крайне неравномерно, у второй переменной, наоборот, сообществ слишком много, поэтому адекватной рекомендации не выйдет.
+
+Таким образом, в content-based рекомендательную систему войдут переменные genres и spoken_languages.
+
+## Тексты
+
+**Переменные:**
+* tagline
+* overview
+
+Мы провели частотный анализ и анализ тональностей, выделили биграммы и разбили текст на темы при помощи LDA. 
+
+С помощью частотного анализа мы пытались выделить характерные для фильмов разных жанров слова, но результаты оказались не особенно содержательными: самые частотные слова в некоторых жанрах совпадают, но контекст, в котором они употребляются, разный. Если использовать эти слова, например, при построении content-based системы, то пользователь может получить некачественную рекомендацию. 
+
+Результаты сентимент-анализа и выделенные биграммы тоже оказались неинформативными, поэтому мы не использовали их при построении рекомендательной системы.
+
+Темы, которые мы получили с помощью LDA, мы решили применить в случае «холодного старта»: если пользователю не знаком или не нравится ни один фильм из нашей базы, он может выбрать интересную ему тему. 
+
+```{r}
+load(file="~/shared/minor2_2019_32/ap_lda_mine.rda") #чтобы сервер не перегружался, загрузим уже готовый файл
+```
+
+```{r}
+#Датасет с вероятностями топиков оказаться в документе:
+ap_documents = tidy(ap_lda, matrix = "gamma")
+#Датасет с вероятностями слов оказаться в топике:
+ap_topics = tidy(ap_lda, matrix = "beta")
+```
+
+Теперь попробую сделать некоторые предположения по пяти топикам. 
+```{r}
+new_ap = ap_topics %>% group_by(term) %>% summarise(beta = max(beta))
+new_ap = ap_topics %>% inner_join(new_ap)
+
+topic = new_ap %>% filter(topic == 3)
+topic %>% arrange(-beta) %>% head(30) %>% mutate(term = reorder(term,beta)) %>% 
+ggplot() +
+  geom_bar(aes(x = term, y = beta), stat = "identity")+
+  theme(axis.text.x = element_text(angle = 90))+
+  coord_flip()
+```
+Посмотрим на третью тему. Похоже, что она выделила фильмы, связанные с пришельцами и космосом.(star, earth, planet, alien)
+
+```{r}
+topic = new_ap %>% filter(topic == 4)
+topic %>% arrange(-beta) %>% head(30) %>% mutate(term = reorder(term,beta)) %>% 
+ggplot() +
+  geom_bar(aes(x = term, y = beta), stat = "identity")+
+  theme(axis.text.x = element_text(angle = 90))+
+  coord_flip()
+```
+4 - семья
+
+```{r}
+topic = new_ap %>% filter(topic == 5)
+topic %>% arrange(-beta) %>% head(30) %>% mutate(term = reorder(term,beta)) %>% 
+ggplot() +
+  geom_bar(aes(x = term, y = beta), stat = "identity")+
+  theme(axis.text.x = element_text(angle = 90))+
+  coord_flip()
+```
+
+5 - бандитские фильмы про гангстеров (prison, fight, money, friends, buried, death)
+
+```{r}
+topic = new_ap %>% filter(topic == 6)
+topic %>% arrange(-beta) %>% head(30) %>% mutate(term = reorder(term,beta)) %>% 
+ggplot() +
+  geom_bar(aes(x = term, y = beta), stat = "identity")+
+  theme(axis.text.x = element_text(angle = 90))+
+  coord_flip()
+```
+6 - школа, необычные существа(Франкенштейн, Бэтмен)
+
+```{r}
+topic = new_ap %>% filter(topic == 7)
+topic %>% arrange(-beta) %>% head(30) %>% mutate(term = reorder(term,beta)) %>% 
+ggplot() +
+  geom_bar(aes(x = term, y = beta), stat = "identity")+
+  theme(axis.text.x = element_text(angle = 90))+
+  coord_flip()
+```
+7 - триллеры и детективы
+
+```{r}
+topic = new_ap %>% filter(topic == 8)
+topic %>% arrange(-beta) %>% head(30) %>% mutate(term = reorder(term,beta)) %>% 
+ggplot() +
+  geom_bar(aes(x = term, y = beta), stat = "identity")+
+  theme(axis.text.x = element_text(angle = 90))+
+  coord_flip()
+```
+8 - Путешествия и приключения
+
+Стоит отметить, что выделенные нами темы в связи с несовершенством алгоритма LDA и относительно небольшим объёмом фильмов являются условными. 
+Может возникнуть вопрос: зачем применять разбиение по темам, если есть жанры, но суть в том, что жанры не всегда отражают тематику фильма. Например, и фильм про инопланетян, и фильм про ограбление может быть отнесён к жанру "Action".
+
+# Примеры работ и их обсуждение
+
+# Ответы на вопросы
+Для начала хотелось бы отметить, что многие заданные нам вопросы относятся к коду. В связи с ограниченным временем мы не могли осветить все технические подробности и презентовали в основном результаты нашего анализа.
+
+1. Почему строили рек-ую систему именно по IBCF?
++ Сначала мы сравнивали системы по общему принципу, и большой разницы между ними не было, поэтому мы оставили IBCF-систему в презентации. Однако после того, как мы сравнили системы при помощи метрик отклонения, мы решили оставить в итоговом отчёте UBCF-систему.
+
+2. Будет ли пользователю удобно вводить 5 любимых фильмов, чтобы получить рекомендацию?(один из способов получения рекомендации)
++ В peer review нам неоднократно намекнули, что 5 фильмов - это очень много, поэтому мы изменили функцию так, чтобы пользователь сам определял, сколько фильмов он хочет ввести.
+
+3. Как разрешили сложность с выдачей рекомендации?(ребята сказали, что долгое время выдавались одинаковые фильмы)
++ Мы отфильтровали датасет по актёрам так, чтобы не было фильмов, где меньше трёх актёров, и проблема решилась. Почему-то фильмы с малым кол-вом актёров имели большой коэффициент similarity со многими фильмами.
+
+4. Были сказаны выводы разведочного анализа без его контента (какие-нибудь графики, например). Оценка системы только на паре примеров не очень показательна.
++ Система была оценена нами на нескольких примерах перед тем, как мы её презентовали, но мы решили выбрать только самый показательный в связи с ограниченным временем. То же самое можно сказать про разведочный анализ. К тому же, текстовый анализ нам почти не помог, и мы решили посвятить больше времени проблеме холодного старта и методам ввода данных (2 функции).
+
+5. Я бы предложил добавить для пользователей ссылку на опрос, чтобы они сами уже оценили качество работы рекомендательной системы 
++ Хорошее предложение, но сложное для технической реализации. Нам нужно бы было вывесить базу из всех фильмов, сказать пользователям выбрать фильм, пользователям бы пришлось ждать, пока мы введём их фильмы в нашу рекомендательную систему и пришлём им результаты, которые они бы оценили. Метод опроса друзей через соц. сети без размещения ссылки показался нам более логичным.
+
+6. Непонятно, как используются данные о любимом и нелюбимом фильме (как именно датасет фильтруется по ним и в каком порядке).
++ Пользователю рекомендуются фильмы, максимально похожие на любимый фильм. Если среди них есть фильмы, похожие на его нелюбимый фильм, то они выведутся из списка рекомендованных. Если нелюбимый фильм пользователя похож на любимый, то мы просим его ввести другой фильм. Или же он может воспользоваться нашей второй функцией.
+
+7. Не было полностью понятно, как было использовано дерево в построении рекомендательной системы
++ Регрессионное дерево использовалось для выявления зависимостей между переменной rating и остальными переменными. До присоединения доп. данных дерево построилось лишь по переменной timestamp, которая показалась нам не очень показательной.Затем мы обнаружили, что существует некоторая связь этой переменной с доп. данными, и оценили точность дерева с помощью различных метрик.
+
+6. Не очень понятно каким образом пользователь может выбрать тему фильма? Что делать в случае абсолютно холодного старта, т. е. пользователь не выбрал любимые фильмы и не смог определиться с темой?
++ Пользователю(в теории, см. пункт отчёта про LDA) предлагается список тем, которые мы выделили с помощью LDA.
++ Если пользователь не смог выбрать ни фильм, ни тему, в теории мы можем предложить ему выбрать фильм с помощью ключевых слов или с помощью слов, которые мы выделили на этапе частотного анализа, но нам кажется, что такой исход маловероятен, так как в нашем датасете есть много популярных фильмов.
+
+7. В рекомендации учитывается весь актерский состав или только главные роли?
++ Актёры в главных ролях (до 5) и режиссёры. 
+
+8. Как учитывается переменная языка фильма? Пользователь ввел название фильма, который доступен не в одном переводе. Как система поймет, на каком языке пользователь посмотрел этот фильм и соответственно, фильм на каком языке ему нужно рекомендовать?
++ Нами учитывается язык оригинала. Многие пользователи предпочитают смотреть только фильмы производства конкретных стран (им соответствует язык оригинала), но переменная production_countries не подходит, так как из неё не видно, какая страна принимала участие в создании фильма больше.
+
+
+9. Что если я введу фильм, которого нет в системе?
++ Система предложит пользователю ввести другой фильм (в обеих функциях) — это видно на строке [какой-то там].
+
+10. Не объяснили почему не использовался метод ubcf
++ Объяснили в первом вопросе.
+
+11. почему не взяли такие параметры, как бюджет, популярность и тд
++ Бюджет при разведочном анализе показал среднюю корреляцию с популярностью, поэтому его решили не включать.
+
+12. Почему был выбран язык фильма в качестве важной характеристики для построения content-based рекомендательной системы? 
++ Разбиение по сообществам на языки на этапе сетевого анализа дало хороший результат. 
+
+13. Не совсем понятно, сколько вообще фильмов осталось после фильтрации
++ После фильтрации по актёрам осталось 545 фильмов из 555
+
+14. Как человек может вводить 5 фильмов и чтобы все попадали в наличие в датасете
++ Если пользователь введёт фильм, которого нет в датасете, функция предложит ему выбрать другой и укажет, какого именно фильма нет в базе.
++ Если пользователь не может ввести 5 фильмов, которые есть в базе, он может воспользоваться функцией с вводом любимого/нелюбимого фильма.
++ К тому же, мы решили модифицировать эту функцию для удобства пользователей, и теперь пользователь может ввести n-ое кол-во любимых фильмов. 
+
+15. Я несколько не поняла, какие фильмы и почему были убраны из рассмотрения из-за того, что они были "доступны на малом количестве языков". Фильмы только на английском, например, и без того собирают большую аудиторию.
++ Это была оговорка. На многих языках доступно очень малое количество фильмов. Будет логично исключить из датасета фильмы, которые были сняты на нераспространённых языках, так как иначе система не сможет подобрать к ним рекомендации, или же рекомендации будут неточны по остальным параметрам.
+
+16. По рекомендациям с любимыми фильмами: насколько точными будут рекомендации пользователю, если его 5 любимых фильмов очень разные? 
++ В презентации мы рассматривали пример, когда пользователь ввёл пять фильмов: Judgement Night, Three Colors: Red, The 39 Steps, Bollywood/Hollywood, Cutthroat Island. Это довольно разные по жанрам фильмы: романтический фильм, драма, триллер, экшн. Рекомендация, которую дала наша система (To Catch a Thief, Rope, Secret Agent, Shart in Africa, Minority Report), во многом совпадает с его вкусами:
+  * жанры фильмов-рекомендаций совпадают с любимыми фильмами пользователя;
+  * совпадают языки;
+  * совпадения по персоналиям:
+    * совпали режиссёры любимого фильма: Alfred Hitchcock, Stephen Hopkins;
+    * совпала актриса из любимого фильма: Madeleine Carroll. 
++ К тому же, разные любимые фильмы позволяют рекомендательной системе лучше выявить все аспекты вкуса пользователя.
+
+# Демонстрация примеров, которые бы хотели видеть наши коллеги
+
+1. Что будет, если я укажу, что мой любимый и нелюбимый фильм в одном жанре? 
++ В нашей рекомендательной системе вы не указываете жанр, а вводите фильм. Посмотрим, что будет, если ввести фильмы одних жанров: "Sleepless in Seattle" как любимый и "Interview with the Vampire" как нелюбимый.
+
+```{r}
+recommend = getGoodFilms("Sleepless in Seattle","Interview with the Vampire",5)
+movies_saved %>% inner_join(recommend) %>% select(movieId, title, original_language, genres, director_name)
+```
+
+```{r}
+try = movies %>% left_join(movies_saved) %>% inner_join(recommend) %>% select(movieId, title, original_language, genres, director_name,actor)
+try2 = movies %>% left_join(movies_saved) %>% filter(title == "Sleepless in Seattle")%>% select(movieId, title, original_language, genres, director_name,actor)
+try %>% select(actor) %>% inner_join(try2)
+try %>% select(director_name) %>% inner_join(try2)
+try %>% select(original_language) %>% inner_join(try2)
+```
+Было рекомендовано 5 фильмов. Фильм "Sleepless in Seattle" является не только romance, но ещё и drama, comedy.
+Фильм "Interview with the Vampire" это ещё и horror. В рекомендациях нет ни одного фильма жанра horror.
+4 актёра из любимого фильма пользователя есть в рекомендованных фильмах. 
+Директора не совпали.
+Язык оригинала, английский, совпал.
+
+Проверим нелюбимый фильм.
+```{r}
+try2 = movies %>% left_join(movies_saved) %>% filter(title == "Interview with the Vampire")%>% select(movieId, title, original_language, genres, director_name,actor)
+try %>% select(actor) %>% inner_join(try2)
+try %>% select(director_name) %>% inner_join(try2)
+try %>% select(original_language) %>% inner_join(try2)
+```
+Не совпало ничего, кроме языка (английский, неудивительно) и жанра romance.
+
+*Именно поэтому мы и выбрали несколько параметров, по которым составляется рекомендация: чтобы лучше выявить вкусы пользователя. Да, жанры любимого и нелюбимого фильма совпадают, но благодаря другим характеристикам рекомендация всё же даётся.*
+
+
+2. Content-based система с жанрами дает меньший вес остальным критериям. В итоге для режиссеров, снимавших разнообразные по жанрам фильмы, будут предлагаться не они, а другие. Например, если я выберу у Стивена Спилберга Пинки и Брейна и Приключения Тинтина, то мне вряд ли предложат Капитана Крюка (хоть это тоже детское произведение), а выдадут что-нибудь схожее, но другого режиссера (например, 101 Далматинец). 
+
++ К сожалению, в нашем датасете нет ни одного указанного вами фильма, поэтому вам бы вывелось сообщение, что фильма нет в датасете, про каждый фильм. Однако попробуем проверить то, о чём вы говорите, на двух фильмах Stanley Kubrick: "Lolita" и "2001: A Space Odyssey".
+```{r}
+set = c("Lolita","2001: A Space Odyssey")
+a = byfilms(set,2,6)
+a %>% filter(title == "The Third Man")
+movies %>% left_join(movies_saved) %>% inner_join(a)%>% select(movieId, title, original_language, genres, director_name,actor) %>% filter(director_name == "Stanley Kubrick")
+```
+
+Если пользователь запросит 6 и более рекомендаций, там будет и фильм Stanley Kubrick. Тем не менее, мы согласны, что это будет неудобно пользователю, который при выборе фильма ориентируется только на режиссёра фильма, но мы полагаем, что таких не большинство(по опросу членов нашей команды и наших семей).
+
+3. Если я введу фильм "Psycho" , порекомендует ли мне система фильм "The Third Man"? 
+
+Только если вы запросите 346 рекомендаций и больше.
+```{r}
+set = "Psycho"
+a = byfilms(set,1,346)
+a %>% filter(title == "The Third Man")
+```
+
+
+4. Предположим в датасете вашей команды нет моих любимых фильмов, но я предпочитаю фильмы про роботов и возможное будущее. Система порекомендует какую-либо из частей Терминатора?
+
+5. Что будет, если я укажу "Мистер и миссис Смит". Ожидаю, что система выдаст 5 фильмов, среди которых будут фильмы с участием Бреда Питта и Анджелины Джоли и фильмы того же режиссера (Дага Лаймона). Например, "Лазурный берег", "Выход через сувенирную лавку", "Ее сердце", "Проклятый дом", "Игра без правил".
+
++Система попросит вас ввести другой фильм, так как его нет в нашем датасете.
+
+
+6. Хотела бы ввести по 1 любимому фильму из 5 франшиз. предполагаю, что мне попадутся еще по 1 фильму из этих же франшиз.
+
+7. Так как учитывается параметр с актером, хотелось бы ввести фильм однокласниики, а на выходе получить другие фильмы с адамом сендлером. 
+
+8. Если пользователь высоко оценил все фильмы Тарантино, то какие 5 фильмов были бы ему рекомендованы (за исключением фильмов Тарантино)? 
+
+Возьмём пользователя 10293, который оценил на 5 единственный фильм режиссуры Тарантино в нашем датасете.
+
+Посмотрим на его любимые фильмы.
+```{r}
+user_rec = ratings99  %>% left_join(movies_saved) %>% filter(userId==10293) %>% arrange(-rating) %>% head(5)
+user_rec = unique(user_rec$title)
+byfilms(user_rec,5,5)
+```
+
+
+
+9. Если мне нравится фильм остров проклятых, увидеть "начало" или "великий гэтсби"
+
++Система попросит вас ввести другой фильм, так как его нет в нашем датасете.
+
+10. Если бы был новый пользователь, которому понравились 5 определенных фильмов, ему порекомендовались бы 5 других фильмов с совпадающими некоторыми характеристиками (например, если бы среди 5 любимых фильмов в большей части играла Энн Хэтэуэй, то с большой вероятностью она будет играть и в предложенных).
+    
+```{r}
+best = 1
+worst = 2
+print("Любимый фильм")
+best
+print("Нелюбимый фильм")
+worst
+```
+
+    
+    
